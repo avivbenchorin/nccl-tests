@@ -135,6 +135,7 @@ struct threadArgs {
   int nThreads;
   int thread;
   int nGpus;
+  int nCommsPerGpu;                // number of comm groups per GPU slot (default 1)
   int* gpus;
   int localRank;
   void** sendbuffs;
@@ -143,6 +144,7 @@ struct threadArgs {
   void** recvbuffs;
   size_t recvInplaceOffset;
   ncclUniqueId ncclId;
+  ncclUniqueId* ncclIds;           // array of nCommsPerGpu unique IDs; ncclIds[0] == ncclId
   ncclComm_t* comms;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
   ncclDevComm* devComms;
@@ -167,6 +169,10 @@ struct threadArgs {
   void** sendRegHandles;
   void** recvRegHandles;
 #endif
+
+  pthread_barrier_t* innerBarrier; // NULL for outer threads; set for inner threads
+  struct threadArgs* outerArgs;    // NULL for outer threads; points to outer for inner threads
+  int commSlot;                    // flat slot index (0 for outer threads)
 };
 
 typedef testResult_t (*threadFunc_t)(struct threadArgs* args);
@@ -177,12 +183,25 @@ struct testThread {
   testResult_t ret;
 };
 
+struct innerThreadArgs {
+  struct threadArgs* outerArgs;    // pointer to outer thread's args
+  int commSlot;                    // flat index in [0, nGpus*nCommsPerGpu)
+  int gpuIdx;                      // commSlot / nCommsPerGpu
+  int commIdx;                     // commSlot % nCommsPerGpu (= group index q)
+  pthread_barrier_t* innerBarrier; // shared barrier for all inner threads of this outer thread
+  int innerThreadCount;            // nGpus * nCommsPerGpu
+  testResult_t result;             // output: return value from runTest
+  int* errors;                     // per-slot error counter
+  double* bw;                      // per-slot bandwidth accumulator
+  int* bw_count;                   // per-slot bw sample count
+};
+
 // Provided by common.cu
 extern void Barrier(struct threadArgs* args);
 extern testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* typeName, ncclRedOp_t op,  const char* opName, int root);
 extern testResult_t InitDataReduce(void* data, const size_t count, const size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks);
 extern testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks, const int rank);
-extern void AllocateBuffs(void **sendbuff, void **recvbuff, void **expected, void **expectedHost, size_t nbytes, int nranks);
+extern testResult_t AllocateBuffs(void **sendbuff, size_t sendBytes, void **recvbuff, size_t recvBytes, void **expected, size_t nbytes);
 
 #include <unistd.h>
 
@@ -291,6 +310,7 @@ static size_t wordSize(ncclDataType_t type) {
 }
 
 extern int test_ncclVersion; // init'd with ncclGetVersion()
+extern int nCommsPerGpu;
 extern int deviceCtaCount; // number of CTAs for device implementation
 constexpr int test_opNumMax = (int)ncclNumOps + (NCCL_VERSION_CODE >= NCCL_VERSION(2,11,0) ? 1 : 0);
 extern int test_opnum;

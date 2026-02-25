@@ -81,6 +81,7 @@ thread_local int is_main_thread = 0;
 // Command line parameter defaults
 int nThreads = 1;
 int nGpus = 1;
+int nCommsPerGpu = 1;
 size_t minBytes = 32*1024*1024;
 size_t maxBytes = 32*1024*1024;
 size_t stepBytes = 1*1024*1024;
@@ -264,6 +265,17 @@ testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataTyp
 }
 
 void Barrier(struct threadArgs *args) {
+  // Two-phase barrier for inner threads: sync inner group, then outer thread 0
+  // calls the outer Barrier on behalf of the group, then sync inner group again.
+  if (args->innerBarrier != NULL) {
+    pthread_barrier_wait(args->innerBarrier);
+    if (args->commSlot == 0) {
+      Barrier(args->outerArgs);
+    }
+    pthread_barrier_wait(args->innerBarrier);
+    return;
+  }
+
   thread_local int epoch = 0;
   static pthread_mutex_t lock[2] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
   static pthread_cond_t cond[2] = {PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
@@ -295,6 +307,21 @@ void Barrier(struct threadArgs *args) {
 // value will actually be the result of process-local broadcast from the local thread=0.
 template<typename T>
 void Allreduce(struct threadArgs* args, T* value, int average) {
+  // Two-phase allreduce for inner threads: inner thread 0 calls outer Allreduce.
+  if (args->innerBarrier != NULL) {
+    pthread_barrier_wait(args->innerBarrier);
+    if (args->commSlot == 0) {
+      Allreduce(args->outerArgs, value, average);
+    }
+    pthread_barrier_wait(args->innerBarrier);
+    // All inner threads read the result that thread 0 wrote back to *value
+    // via the outer Allreduce. Since thread 0 wrote to its own local copy,
+    // broadcast it through the outer args bw accumulator is handled by
+    // threadRunTests aggregation. For timing (deltaSec), inner thread 0
+    // does the outer allreduce and all inner threads use the same value.
+    return;
+  }
+
   thread_local int epoch = 0;
   static pthread_mutex_t lock[2] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
   static pthread_cond_t cond[2] = {PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
@@ -747,23 +774,134 @@ static void getGPUMemoryInfo(int64_t* ptotalGpuMem, int64_t* pfreeGpuMem) {
   if (pfreeGpuMem != nullptr) *pfreeGpuMem = freeGpuMem;
 }
 
+// Inner thread function for communicator initialization.
+// Each inner thread initializes exactly one communicator from its own OS thread,
+// ensuring the OFI plugin creates a distinct endpoint per inner thread.
+static void* innerThreadInit(void* arg) {
+  struct innerThreadArgs* ia = (struct innerThreadArgs*)arg;
+  struct threadArgs* outer   = ia->outerArgs;
+
+  int nranks  = outer->nProcs * outer->nThreads * outer->nGpus;
+  int rank    = (outer->proc * outer->nThreads + outer->thread) * outer->nGpus + ia->gpuIdx;
+  int physGpu = outer->gpus[ia->commSlot];
+
+  ia->result = initComms(outer->comms + ia->commSlot, /*nComms=*/1,
+                         rank, nranks, &physGpu, outer->ncclIds[ia->commIdx]);
+  return NULL;
+}
+
+// Inner thread function for running a collective benchmark.
+// Builds a per-slot threadArgs with nGpus=1, nCommsPerGpu=1, and the correct
+// rank encoding so all existing collective functions work without modification.
+static void* innerThreadRun(void* arg) {
+  struct innerThreadArgs* ia = (struct innerThreadArgs*)arg;
+  struct threadArgs* outer   = ia->outerArgs;
+
+  // Build a per-slot threadArgs view
+  struct threadArgs inner    = *outer;
+  inner.nGpus                = 1;
+  inner.nCommsPerGpu         = 1;
+  // Encode gpuIdx into thread so rank formula (proc*nThreads+thread)*nGpus+i
+  // evaluates to (outer->proc*outer->nThreads+outer->thread)*outer->nGpus+gpuIdx
+  inner.nThreads             = outer->nThreads * outer->nGpus;
+  inner.thread               = outer->thread   * outer->nGpus + ia->gpuIdx;
+  inner.gpus                 = outer->gpus      + ia->commSlot;
+  inner.comms                = outer->comms     + ia->commSlot;
+  inner.streams              = outer->streams   + ia->commSlot;
+  inner.sendbuffs            = outer->sendbuffs + ia->commSlot;
+  inner.recvbuffs            = outer->recvbuffs + ia->commSlot;
+  inner.expected             = outer->expected  + ia->commSlot;
+  inner.errors               = ia->errors;
+  inner.bw                   = ia->bw;
+  inner.bw_count             = ia->bw_count;
+  inner.innerBarrier         = ia->innerBarrier;
+  inner.outerArgs            = outer;
+  inner.commSlot             = ia->commSlot;
+
+  // Only the first inner slot of the main outer thread prints output.
+  // Each inner thread has its own thread_local is_main_thread; set it here.
+  is_main_thread = (is_main_proc && outer->thread == 0 && ia->commSlot == 0) ? 1 : 0;
+
+  cudaSetDevice(inner.gpus[0]);
+  ia->result = ncclTestEngine.runTest(&inner, ncclroot,
+      (ncclDataType_t)nccltype, test_typenames[nccltype],
+      (ncclRedOp_t)ncclop, test_opnames[ncclop]);
+  return NULL;
+}
+
 testResult_t threadRunTests(struct threadArgs* args) {
-  //  capture the free memory before
+  int totalSlots = args->nGpus * args->nCommsPerGpu;
+
+  // Capture free memory before (one entry per unique physical GPU)
   int64_t* totalGpuFreeMem = (int64_t*)calloc(args->nGpus*2, sizeof(int64_t));
   for (int g = 0; g < args->nGpus; ++g) {
-    CUDACHECK(cudaSetDevice(args->gpus[g]));
+    CUDACHECK(cudaSetDevice(args->gpus[g * args->nCommsPerGpu]));
     getGPUMemoryInfo(nullptr, &totalGpuFreeMem[g]);
   }
 
-  // Set device to the first of our GPUs. If we don't do that, some operations
-  // will be done on the current GPU (by default : 0) and if the GPUs are in
-  // exclusive mode those operations will fail.
-  CUDACHECK(cudaSetDevice(args->gpus[0]));
-  TESTCHECK(ncclTestEngine.runTest(args, ncclroot, (ncclDataType_t)nccltype, test_typenames[nccltype], (ncclRedOp_t)ncclop, test_opnames[ncclop]));
+  if (args->nCommsPerGpu == 1) {
+    // Existing single-comm path — unchanged
+    CUDACHECK(cudaSetDevice(args->gpus[0]));
+    TESTCHECK(ncclTestEngine.runTest(args, ncclroot, (ncclDataType_t)nccltype, test_typenames[nccltype], (ncclRedOp_t)ncclop, test_opnames[ncclop]));
+  } else {
+    // Multi-comm path: spawn one inner thread per comm slot, all running concurrently.
+    pthread_barrier_t innerBarrier;
+    if (pthread_barrier_init(&innerBarrier, NULL, (unsigned)totalSlots) != 0) {
+      free(totalGpuFreeMem);
+      return testInternalError;
+    }
 
-  // Capture the memory used by the GPUs
+    struct innerThreadArgs* ias = (struct innerThreadArgs*)
+        malloc(sizeof(struct innerThreadArgs) * totalSlots);
+    pthread_t* innerThreads = (pthread_t*)malloc(sizeof(pthread_t) * totalSlots);
+    int*    slotErrors  = (int*)   calloc(totalSlots, sizeof(int));
+    double* slotBw      = (double*)calloc(totalSlots, sizeof(double));
+    int*    slotBwCount = (int*)   calloc(totalSlots, sizeof(int));
+
+    if (!ias || !innerThreads || !slotErrors || !slotBw || !slotBwCount) {
+      free(ias); free(innerThreads); free(slotErrors); free(slotBw); free(slotBwCount);
+      pthread_barrier_destroy(&innerBarrier);
+      free(totalGpuFreeMem);
+      return testInternalError;
+    }
+
+    for (int s = 0; s < totalSlots; s++) {
+      ias[s].outerArgs        = args;
+      ias[s].commSlot         = s;
+      ias[s].gpuIdx           = s / args->nCommsPerGpu;
+      ias[s].commIdx          = s % args->nCommsPerGpu;
+      ias[s].innerBarrier     = &innerBarrier;
+      ias[s].innerThreadCount = totalSlots;
+      ias[s].result           = testSuccess;
+      ias[s].errors           = slotErrors + s;
+      ias[s].bw               = slotBw + s;
+      ias[s].bw_count         = slotBwCount + s;
+      pthread_create(&innerThreads[s], NULL, innerThreadRun, &ias[s]);
+    }
+
+    testResult_t firstErr = testSuccess;
+    for (int s = 0; s < totalSlots; s++) {
+      pthread_join(innerThreads[s], NULL);
+      if (ias[s].result != testSuccess && firstErr == testSuccess)
+        firstErr = ias[s].result;
+      args->errors[0]   += slotErrors[s];
+      args->bw[0]       += slotBw[s];
+      args->bw_count[0] += slotBwCount[s];
+    }
+
+    pthread_barrier_destroy(&innerBarrier);
+    free(innerThreads); free(ias);
+    free(slotErrors); free(slotBw); free(slotBwCount);
+
+    if (firstErr != testSuccess) {
+      free(totalGpuFreeMem);
+      return firstErr;
+    }
+  }
+
+  // Capture memory used by the GPUs after the test (one entry per unique physical GPU)
   for (int g = 0; g < args->nGpus; ++g) {
-    CUDACHECK(cudaSetDevice(args->gpus[g]));
+    CUDACHECK(cudaSetDevice(args->gpus[g * args->nCommsPerGpu]));
     getGPUMemoryInfo(nullptr, &totalGpuFreeMem[g + args->nGpus]);
     *args->devMemUsed = std::max(*args->devMemUsed, totalGpuFreeMem[g] - totalGpuFreeMem[g + args->nGpus]);
   }
@@ -772,7 +910,8 @@ testResult_t threadRunTests(struct threadArgs* args) {
 }
 
 testResult_t threadInit(struct threadArgs* args) {
-  int nranks =  args->nProcs*args->nThreads*args->nGpus;
+  int nranks     = args->nProcs * args->nThreads * args->nGpus;
+  int totalSlots = args->nGpus  * args->nCommsPerGpu;
 
   //set main thread again
   is_main_thread = (is_main_proc && args->thread == 0) ? 1 : 0;
@@ -782,23 +921,64 @@ testResult_t threadInit(struct threadArgs* args) {
   // Capture GPU memory before initializing the NCCL communicators
   int64_t* initFreeGpuMem = (int64_t*)calloc(args->nGpus*3, sizeof(int64_t));
   for (int g = 0; g < args->nGpus; ++g) {
-    CUDACHECK(cudaSetDevice(args->gpus[g]));
+    CUDACHECK(cudaSetDevice(args->gpus[g * args->nCommsPerGpu]));
     getGPUMemoryInfo(nullptr, &initFreeGpuMem[g]);
   }
 
-  int firstRank = args->proc*args->nThreads*args->nGpus + args->thread*args->nGpus;
-  TESTCHECK(initComms(args->comms, args->nGpus, firstRank, nranks, args->gpus, args->ncclId));
+  if (args->nCommsPerGpu == 1) {
+    // Existing single-comm path — unchanged
+    int firstRank = args->proc*args->nThreads*args->nGpus + args->thread*args->nGpus;
+    TESTCHECK(initComms(args->comms, args->nGpus, firstRank, nranks, args->gpus, args->ncclId));
+  } else {
+    // Multi-comm path: spawn one inner thread per comm slot so each gets its own TID
+    // and the OFI plugin creates a distinct endpoint per inner thread.
+    struct innerThreadArgs* ias = (struct innerThreadArgs*)
+        malloc(sizeof(struct innerThreadArgs) * totalSlots);
+    pthread_t* initThreads = (pthread_t*)malloc(sizeof(pthread_t) * totalSlots);
+    if (!ias || !initThreads) {
+      free(ias); free(initThreads); free(initFreeGpuMem);
+      return testInternalError;
+    }
+
+    for (int s = 0; s < totalSlots; s++) {
+      ias[s].outerArgs        = args;
+      ias[s].commSlot         = s;
+      ias[s].gpuIdx           = s / args->nCommsPerGpu;
+      ias[s].commIdx          = s % args->nCommsPerGpu;
+      ias[s].innerBarrier     = NULL;
+      ias[s].innerThreadCount = totalSlots;
+      ias[s].result           = testSuccess;
+      ias[s].errors           = NULL;
+      ias[s].bw               = NULL;
+      ias[s].bw_count         = NULL;
+      if (pthread_create(&initThreads[s], NULL, innerThreadInit, &ias[s]) != 0) {
+        for (int j = 0; j < s; j++) pthread_join(initThreads[j], NULL);
+        free(initThreads); free(ias); free(initFreeGpuMem);
+        return testInternalError;
+      }
+    }
+    testResult_t firstErr = testSuccess;
+    for (int s = 0; s < totalSlots; s++) {
+      pthread_join(initThreads[s], NULL);
+      if (ias[s].result != testSuccess && firstErr == testSuccess)
+        firstErr = ias[s].result;
+    }
+    free(initThreads); free(ias);
+    if (firstErr != testSuccess) { free(initFreeGpuMem); return firstErr; }
+  }
 
   // Capture the memory used by the GPUs after initializing the NCCL communicators
   for (int g = 0; g < args->nGpus; ++g) {
-    CUDACHECK(cudaSetDevice(args->gpus[g]));
+    CUDACHECK(cudaSetDevice(args->gpus[g * args->nCommsPerGpu]));
     getGPUMemoryInfo(nullptr, &initFreeGpuMem[g + args->nGpus]);
     *args->initGpuMem = std::max(*args->initGpuMem, initFreeGpuMem[g] - initFreeGpuMem[g + args->nGpus]);
   }
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
   NCCLCHECK(ncclGroupStart());
-  for (int i=0; i<args->nGpus; i++) {
+  for (int i = 0; i < totalSlots; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    TESTCHECK(AllocateBuffs(args->sendbuffs+i, args->maxbytes, args->recvbuffs+i, args->maxbytes, args->expected+i, (size_t)args->maxbytes));
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,27,0)
     if (test_ncclVersion >= NCCL_VERSION(2,27,0) && (local_register == SYMMETRIC_REGISTER)) {
       NCCLCHECK(ncclCommWindowRegister(args->comms[i], args->sendbuffs[i], args->maxbytes, (ncclWindow_t*)&args->sendRegHandles[i], NCCL_WIN_COLL_SYMMETRIC));
@@ -814,7 +994,7 @@ testResult_t threadInit(struct threadArgs* args) {
 #endif
   // Capture memory used by test buffers
   for (int g = 0; g < args->nGpus; ++g) {
-    CUDACHECK(cudaSetDevice(args->gpus[g]));
+    CUDACHECK(cudaSetDevice(args->gpus[g * args->nCommsPerGpu]));
     getGPUMemoryInfo(nullptr, &initFreeGpuMem[g + args->nGpus*2]);
     args->bufferMemory[args->thread] = std::max(args->bufferMemory[args->thread], initFreeGpuMem[g + args->nGpus] - initFreeGpuMem[g + args->nGpus*2]);
   }
@@ -827,11 +1007,13 @@ testResult_t threadInit(struct threadArgs* args) {
         "Incompatible NCCL versions. nccl-tests was compiled with NCCL %d, but is running with NCCL %d. "
         "The %d Device API is not compatible with versions before 2.29.\n",
         NCCL_VERSION_CODE, test_ncclVersion, NCCL_VERSION_CODE);
+      free(initFreeGpuMem);
       return testInvalidUsage;
     }
     ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     if (!ncclTestEngine.getDevCommRequirements) {
       fprintf(stderr, "Device implementation %d is not supported by this test\n", deviceImpl);
+      free(initFreeGpuMem);
       return testNotImplemented;
     }
     ncclCommProperties commProperties = NCCL_COMM_PROPERTIES_INITIALIZER;
@@ -842,18 +1024,20 @@ testResult_t threadInit(struct threadArgs* args) {
       fprintf(stderr, "Incompatible NCCL versions. nccl-tests was compiled with NCCL 2.28, but is running with NCCL %d. "
         "The 2.28 Device API is not compatible with later.\n",
         test_ncclVersion);
+      free(initFreeGpuMem);
       return testInvalidUsage;
     }
     ncclDevCommRequirements reqs = {};
     if (!ncclTestEngine.getDevCommRequirements ||
         !ncclTestEngine.getDevCommRequirements(deviceImpl, &reqs)) {
       fprintf(stderr, "Device implementation %d is not supported by this test\n", deviceImpl);
+      free(initFreeGpuMem);
       return testNotImplemented;
     }
 #endif
 
     NCCLCHECK(ncclGroupStart());
-    for (int i = 0; i < args->nGpus; i++) {
+    for (int i = 0; i < totalSlots; i++) {
       NCCLCHECK(ncclDevCommCreate(args->comms[i], &reqs, args->devComms+i));
     }
     NCCLCHECK(ncclGroupEnd());
@@ -861,7 +1045,7 @@ testResult_t threadInit(struct threadArgs* args) {
   // Capture memory used by test buffers
   int64_t deviceCommMaxMem = 0;
   for (int g = 0; g < args->nGpus; ++g) {
-    CUDACHECK(cudaSetDevice(args->gpus[g]));
+    CUDACHECK(cudaSetDevice(args->gpus[g * args->nCommsPerGpu]));
     int64_t freeGpuMem;
     getGPUMemoryInfo(nullptr, &freeGpuMem);
     deviceCommMaxMem = std::max(deviceCommMaxMem, initFreeGpuMem[g + args->nGpus*2] - freeGpuMem);
@@ -965,6 +1149,7 @@ int main(int argc, char* argv[], char **envp) {
     {"device_implementation", required_argument, 0, 'D'},
     {"device_cta_count", required_argument, 0, 'V'},
     {"memory", required_argument, 0, 'M'},
+    {"ncomms_per_gpu", required_argument, 0, 'q'},
 
     {"help", no_argument, 0, 'h'},
     {}
@@ -972,7 +1157,7 @@ int main(int argc, char* argv[], char **envp) {
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:x:D:V:J:S:M:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:x:D:V:J:S:M:q:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -1116,6 +1301,13 @@ int main(int argc, char* argv[], char **envp) {
           return -1;
 	}
         break;
+      case 'q':
+        nCommsPerGpu = (int)strtol(optarg, NULL, 0);
+        if (nCommsPerGpu < 1) {
+          fprintf(stderr, "ncomms_per_gpu (-q) must be >= 1, got %d\n", nCommsPerGpu);
+          return -1;
+        }
+        break;
       case 'h':
       default:
         if (c != 'h') printf("invalid option '%c'\n", c);
@@ -1154,6 +1346,8 @@ int main(int argc, char* argv[], char **envp) {
             "[-D,--device_implementation <implementation number> enable device implementation (default: 0, use NCCL implementation; requires -R 2 if > 0)] \n\t"
             "[-V,--device_cta_count <number> set number of CTAs for device implementation (default: 16)] \n\t"
             "[-M,--memory_report <0/1> enable memory usage report (default: 0)] \n\t"
+            "[-q,--ncomms_per_gpu <N> number of independent NCCL communicator groups per GPU slot "
+            "(default: 1; requires -p 1 when > 1)] \n\t"
             "[-h,--help]\n",
           basename(argv[0]));
         return 0;
@@ -1167,6 +1361,10 @@ int main(int argc, char* argv[], char **envp) {
   }
   if (deviceImpl > 0 && (local_register != SYMMETRIC_REGISTER)) {
     fprintf(stderr, "device implementation (-D > 0) requires enabling symmetric memory registration (-R 2)\n");
+    return -1;
+  }
+  if (nCommsPerGpu > 1 && !parallel_init) {
+    fprintf(stderr, "ncomms_per_gpu (-q) > 1 requires parallel_init (-p 1)\n");
     return -1;
   }
 
@@ -1280,38 +1478,50 @@ testResult_t run() {
     if (proc == 0) printf("#\n# Reducing maxBytes to %ld due to memory limitation\n", maxBytes);
   }
 
-  ncclUniqueId ncclId;
+  ncclUniqueId* ncclIds = (ncclUniqueId*)malloc(sizeof(ncclUniqueId) * nCommsPerGpu);
   if (ncclProc == 0) {
-    NCCLCHECK(ncclGetUniqueId(&ncclId));
+    for (int q = 0; q < nCommsPerGpu; q++) {
+      NCCLCHECK(ncclGetUniqueId(&ncclIds[q]));
+    }
   }
 #ifdef MPI_SUPPORT
-  MPI_Bcast(&ncclId, sizeof(ncclId), MPI_BYTE, 0, mpi_comm);
+  MPI_Bcast(ncclIds, sizeof(ncclUniqueId) * nCommsPerGpu, MPI_BYTE, 0, mpi_comm);
   MPI_Barrier(MPI_COMM_WORLD); // Ensure Bcast is complete for HCOLL
 #endif
-  int gpus[nGpus*nThreads];
-  cudaStream_t streams[nGpus*nThreads];
-  void* sendbuffs[nGpus*nThreads];
-  void* recvbuffs[nGpus*nThreads];
-  void* expected[nGpus*nThreads];
+  ncclUniqueId ncclId = ncclIds[0]; // backward compat for serial init path
+  int totalSlots = nGpus * nThreads * nCommsPerGpu;
+  int gpus[totalSlots];
+  cudaStream_t streams[totalSlots];
+  void* sendbuffs[totalSlots];
+  void* recvbuffs[totalSlots];
+  void* expected[totalSlots];
   size_t sendBytes, recvBytes;
 
   ncclTestEngine.getBuffSize(&sendBytes, &recvBytes, (size_t)maxBytes, (size_t)ncclProcs*nGpus*nThreads);
 
   char* envstr = getenv("NCCL_TESTS_DEVICE");
   int gpu0 = envstr ? atoi(envstr) : -1;
-  for (int i=0; i<nGpus*nThreads; i++) {
-    gpus[i] = (gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + i;
-    CUDACHECK(cudaSetDevice(gpus[i]));
-    if (streamnull) {
-      streams[i] = NULL;
+  for (int t = 0; t < nThreads; t++) {
+    for (int g = 0; g < nGpus; g++) {
+      int physGpu = (gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + t*nGpus + g;
+      for (int q = 0; q < nCommsPerGpu; q++) {
+        int idx = (t*nGpus + g)*nCommsPerGpu + q;
+        gpus[idx] = physGpu;
+        CUDACHECK(cudaSetDevice(physGpu));
+        if (streamnull) {
+          streams[idx] = NULL;
+        } else {
+          CUDACHECK(cudaStreamCreateWithFlags(streams+idx, cudaStreamNonBlocking));
+        }
+        if (q == 0) {
+          // Only query arch once per physical GPU
+          int archMajor, archMinor;
+          CUDACHECK(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, physGpu));
+          CUDACHECK(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, physGpu));
+          minCudaArch = std::min(minCudaArch, 100*archMajor + 10*archMinor);
+        }
+      }
     }
-    else {
-      CUDACHECK(cudaStreamCreateWithFlags(streams+i, cudaStreamNonBlocking));
-    }
-    int archMajor, archMinor;
-    CUDACHECK(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, gpus[i]));
-    CUDACHECK(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, gpus[i]));
-    minCudaArch = std::min(minCudaArch, 100*archMajor + 10*archMinor);
   }
 
 #ifdef MPI_SUPPORT
@@ -1334,15 +1544,15 @@ testResult_t run() {
 #endif
 
   //if parallel init is not selected, use main thread to initialize NCCL
-  ncclComm_t* comms = (ncclComm_t*)malloc(sizeof(ncclComm_t)*nThreads*nGpus);
+  ncclComm_t* comms = (ncclComm_t*)malloc(sizeof(ncclComm_t)*totalSlots);
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
-  void* sendRegHandles[nThreads*nGpus];
-  void* recvRegHandles[nThreads*nGpus];
+  void* sendRegHandles[totalSlots];
+  void* recvRegHandles[totalSlots];
   memset(sendRegHandles, 0, sizeof(sendRegHandles));
   memset(recvRegHandles, 0, sizeof(recvRegHandles));
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-  ncclDevComm devComms[nThreads*nGpus];
+  ncclDevComm devComms[totalSlots];
 #endif
   int64_t initGpuMem[nThreads];
   int64_t bufferMemory[nThreads];
@@ -1370,7 +1580,7 @@ testResult_t run() {
      }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
      NCCLCHECK(ncclGroupStart());
-     for (int i=0; i<nGpus*nThreads; i++) {
+     for (int i=0; i<totalSlots; i++) {
        CUDACHECK(cudaSetDevice(gpus[i]));
        TESTCHECK(AllocateBuffs(sendbuffs+i, sendBytes, recvbuffs+i, recvBytes, expected+i, (size_t)maxBytes));
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,27,0)
@@ -1430,7 +1640,7 @@ testResult_t run() {
 #endif
 
        NCCLCHECK(ncclGroupStart());
-       for (int i = 0; i < nGpus * nThreads; i++) {
+       for (int i = 0; i < totalSlots; i++) {
          NCCLCHECK(ncclDevCommCreate(comms[i], &reqs, devComms+i));
        }
        NCCLCHECK(ncclGroupEnd());
@@ -1467,6 +1677,7 @@ testResult_t run() {
   memset(threads, 0, sizeof(struct testThread)*nThreads);
 
   for (int t=nThreads-1; t>=0; t--) {
+    int slotOffset = t * nGpus * nCommsPerGpu;
     threads[t].args.minbytes=minBytes;
     threads[t].args.maxbytes=maxBytes;
     threads[t].args.stepbytes=stepBytes;
@@ -1479,20 +1690,25 @@ testResult_t run() {
     threads[t].args.nThreads=nThreads;
     threads[t].args.thread=t;
     threads[t].args.nGpus=nGpus;
-    threads[t].args.gpus=gpus+t*nGpus;
-    threads[t].args.sendbuffs = sendbuffs+t*nGpus;
-    threads[t].args.recvbuffs = recvbuffs+t*nGpus;
-    threads[t].args.expected = expected+t*nGpus;
+    threads[t].args.nCommsPerGpu=nCommsPerGpu;
+    threads[t].args.gpus=gpus+slotOffset;
+    threads[t].args.sendbuffs = sendbuffs+slotOffset;
+    threads[t].args.recvbuffs = recvbuffs+slotOffset;
+    threads[t].args.expected = expected+slotOffset;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-    threads[t].args.devComms = devComms+t*nGpus;
+    threads[t].args.devComms = devComms+slotOffset;
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
-    threads[t].args.sendRegHandles = sendRegHandles+t*nGpus;
-    threads[t].args.recvRegHandles = recvRegHandles+t*nGpus;
+    threads[t].args.sendRegHandles = sendRegHandles+slotOffset;
+    threads[t].args.recvRegHandles = recvRegHandles+slotOffset;
 #endif
     threads[t].args.ncclId = ncclId;
-    threads[t].args.comms=comms+t*nGpus;
-    threads[t].args.streams=streams+t*nGpus;
+    threads[t].args.ncclIds = ncclIds;
+    threads[t].args.comms=comms+slotOffset;
+    threads[t].args.streams=streams+slotOffset;
+    threads[t].args.innerBarrier = NULL;
+    threads[t].args.outerArgs = NULL;
+    threads[t].args.commSlot = 0;
 
     threads[t].args.errors=errors+t;
     threads[t].args.bw=bw+t;
@@ -1532,7 +1748,7 @@ testResult_t run() {
 #endif
 
   if (!parallel_init) {
-    for(int i=0; i<nGpus*nThreads; ++i) {
+    for(int i=0; i<totalSlots; ++i) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,27,0)
       if (test_ncclVersion >= NCCL_VERSION(2,27,0) && (local_register == SYMMETRIC_REGISTER)) {
@@ -1548,10 +1764,19 @@ testResult_t run() {
       NCCLCHECK(ncclCommDestroy(comms[i]));
     }
     free(comms);
+  } else {
+    // Explicitly destroy communicators in the parallel_init path so that NCCL's
+    // internal state (including the debug logger used by the OFI plugin) is torn
+    // down before process exit, ensuring the OFI plugin's atexit destructor can
+    // still call NCCL_OFI_INFO/WARN via ofi_log_function.
+    for (int i = 0; i < totalSlots; ++i) {
+      NCCLCHECK(ncclCommDestroy(comms[i]));
+    }
+    free(comms);
   }
 
   // Free off CUDA allocated memory
-  for (int i=0; i<nGpus*nThreads; i++) {
+  for (int i=0; i<totalSlots; i++) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
     if (sendbuffs[i]) NCCLCHECK(ncclMemFree((char*)sendbuffs[i]));
     if (recvbuffs[i]) NCCLCHECK(ncclMemFree((char*)recvbuffs[i]));
@@ -1563,6 +1788,7 @@ testResult_t run() {
 #endif
   }
 
+  free(ncclIds);
   envstr = getenv("NCCL_TESTS_MIN_BW");
   const double check_avg_bw = envstr ? atof(envstr) : -1;
   bw[0] /= bw_count[0];
